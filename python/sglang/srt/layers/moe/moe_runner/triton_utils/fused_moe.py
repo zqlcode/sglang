@@ -129,6 +129,7 @@ def inplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_mxfp4_w4a16: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -162,6 +163,7 @@ def inplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
     )
 
 
@@ -197,6 +199,7 @@ def outplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_mxfp4_w4a16: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -230,6 +233,7 @@ def outplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
     )
 
 
@@ -254,6 +258,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
+    use_mxfp4_w4a16: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -292,6 +297,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_mxfp4_w4a16=use_mxfp4_w4a16,
         )
         return hidden_states
     else:
@@ -326,6 +332,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_mxfp4_w4a16=use_mxfp4_w4a16,
         )
 
 
@@ -377,6 +384,7 @@ def _prepare_fused_moe_run(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
 ):
@@ -396,12 +404,19 @@ def _prepare_fused_moe_run(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         dtype=hidden_states.dtype,
     )
 
+    w1_shape = w1.shape
+    w2_shape = (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size)
+    if use_mxfp4_w4a16:
+        # Config tables key on logical K; MXFP4 stores packed K/2.
+        w1_shape = (w1.shape[0], w1.shape[1], w1.shape[2] * 2)
+        w2_shape = (w2.shape[0], w2.shape[1], w2.shape[2] * 2)
     config, (down_config, _) = try_get_optimal_moe_config(
-        w1.shape,
-        (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
+        w1_shape,
+        w2_shape,
         topk_ids.shape[1],
         config_dtype,
         num_tokens,
@@ -411,6 +426,7 @@ def _prepare_fused_moe_run(
     )
     down_moe_use_tma = (
         _down_moe_use_tma()
+        and not use_mxfp4_w4a16
         and down_config is not None
         and down_config.pop("USE_TMA", False)
     )
@@ -448,6 +464,7 @@ def _fused_moe_kernel_sequence(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp4_w4a16: bool,
     per_channel_quant: bool,
     w1_scale: Optional[torch.Tensor],
     w2_scale: Optional[torch.Tensor],
@@ -536,6 +553,7 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not use_mxfp4_w4a16)
     )
 
     intermediate_cache1 = torch.empty(
@@ -565,6 +583,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
@@ -764,6 +783,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         a_use_tma=down_moe_use_tma,
@@ -892,13 +912,14 @@ def fused_experts_impl(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_mxfp4_w4a16: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_mxfp4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -926,6 +947,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
@@ -948,6 +970,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -992,6 +1015,7 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_mxfp4_w4a16: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1014,6 +1038,8 @@ def fused_moe(
     - use_int4_w4a16 (bool): If True, use matmul of int4 weight and bf16/fp16
         activation to compute the inner products for w1 and w2.
         Defaults to False.
+    - use_mxfp4_w4a16 (bool): If True, consume packed E2M1 weights with
+        per-32 UE8M0 scales directly in the routed Triton kernel.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
     - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -1074,4 +1100,5 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
     )

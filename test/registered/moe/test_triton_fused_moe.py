@@ -1,18 +1,134 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    "Triton MXFP4 dot_scaled requires SM90 or newer",
+)
+def test_triton_mxfp4_fused_moe_matches_torch_reference():
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    torch.manual_seed(1)
+
+    num_tokens = 17
+    hidden_size = 64
+    intermediate_size = 64
+    num_experts = 2
+    top_k = 2
+    scale_value = 0.0625
+    e2m1_values = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        device="cuda",
+    )
+
+    def make_mxfp4_weight(num_rows: int, logical_k: int):
+        codes = torch.randint(
+            0,
+            16,
+            (num_experts, num_rows, logical_k),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+        scales = torch.full(
+            (num_experts, num_rows, logical_k // 32),
+            scale_value,
+            device="cuda",
+            dtype=torch.float8_e8m0fnu,
+        )
+        dequantized = (e2m1_values[codes.long()] * scale_value).to(torch.bfloat16)
+        return (
+            packed.contiguous(),
+            scales.view(torch.uint8).contiguous(),
+            dequantized,
+        )
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
+    )
+    hidden_states_ref = hidden_states.clone()
+    w1, w1_scale, w1_ref = make_mxfp4_weight(2 * intermediate_size, hidden_size)
+    w2, w2_scale, w2_ref = make_mxfp4_weight(hidden_size, intermediate_size)
+
+    router_logits = torch.randn(
+        (num_tokens, num_experts), device="cuda", dtype=torch.float32
+    )
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(router_logits, dim=-1), top_k, dim=-1
+    )
+    topk_output = StandardTopKOutput(
+        topk_weights,
+        topk_ids.to(torch.int32),
+        router_logits,
+    )
+    runner_config = MoeRunnerConfig(
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+        inplace=True,
+    )
+
+    output = fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_output,
+        moe_runner_config=runner_config,
+        use_mxfp4_w4a16=True,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=[0, 32],
+    )
+
+    reference = []
+    for token in range(num_tokens):
+        token_output = torch.zeros(hidden_size, device="cuda", dtype=torch.float32)
+        for route in range(top_k):
+            expert = int(topk_ids[token, route])
+            gate_up = (hidden_states_ref[token].float() @ w1_ref[expert].float().T).to(
+                torch.bfloat16
+            )
+            activated = (
+                F.silu(gate_up[:intermediate_size]) * gate_up[intermediate_size:]
+            ).to(torch.bfloat16)
+            down = (activated.float() @ w2_ref[expert].float().T).to(torch.bfloat16)
+            token_output += topk_weights[token, route] * down.float()
+        reference.append(token_output)
+    reference = torch.stack(reference).to(torch.bfloat16)
+
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=0.08)
 
 
 class TestFusedMOE(CustomTestCase):

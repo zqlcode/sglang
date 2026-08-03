@@ -1377,6 +1377,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        fp4_scale_dtype = None
+        if self.is_fp4_expert and _is_cuda:
+            moe_runner_backend = get_moe_runner_backend()
+            if moe_runner_backend.is_triton() or (
+                moe_runner_backend.is_auto()
+                and not self.is_deepgemm_moe_runner_backend_enabled()
+            ):
+                fp4_scale_dtype = torch.float8_e8m0fnu
+
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -1389,6 +1398,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            fp4_scale_dtype=fp4_scale_dtype,
             **extra_weight_attrs,
         )
 
@@ -2315,6 +2325,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
         )
 
+    def get_triton_mxfp4_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        if not _is_cuda:
+            raise RuntimeError("Triton MXFP4 is only supported on CUDA")
+        w13_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+        if w13_scale.dtype != torch.float8_e8m0fnu:
+            raise RuntimeError(
+                "Triton MXFP4 requires raw UE8M0 scales; reload the model "
+                "with the Triton MoE backend selected."
+            )
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight.view(torch.uint8),
+            w2_weight=layer.w2_weight.view(torch.uint8),
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+            use_mxfp4_w4a16=True,
+            use_fp8_w8a8=False,
+            w13_scale=w13_scale.view(torch.uint8),
+            w2_scale=w2_scale.view(torch.uint8),
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=[0, 32],
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2547,7 +2581,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
         elif self.runner.runner_backend.is_triton():
-            quant_info = self.get_triton_quant_info(layer)
+            if self.is_fp4_expert:
+                quant_info = self.get_triton_mxfp4_quant_info(layer)
+            else:
+                quant_info = self.get_triton_quant_info(layer)
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend

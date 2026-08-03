@@ -346,11 +346,14 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
+    use_mxfp4_w4a16: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "fp8_w8a8"
     elif use_int8_w8a8:
         return "int8_w8a8"
+    elif use_mxfp4_w4a16:
+        return "mxfp4_w4a16"
     elif use_int4_w4a16:
         return "int4_w4a16"
     elif use_int8_w8a16:

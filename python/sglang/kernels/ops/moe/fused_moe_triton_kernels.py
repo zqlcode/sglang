@@ -29,6 +29,8 @@ from sglang.srt.utils import (
     is_sm90_supported,
 )
 
+from .mxfp4_moe import invoke_mxfp4_moe_kernel
+
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -745,6 +747,7 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    use_mxfp4_w4a16: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -800,7 +803,7 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or use_mxfp4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -812,7 +815,7 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
-    K = B.shape[2] - padded_size
+    K = B.shape[2] * 2 if use_mxfp4_w4a16 else B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
@@ -840,7 +843,32 @@ def invoke_fused_moe_kernel(
         ), "add_output_mask required when mask_output=True"
     # ===== END TO BE REFACTORED ====
 
-    if (
+    if use_mxfp4_w4a16:
+        invoke_mxfp4_moe_kernel(
+            A=A,
+            B=B,
+            bias=bias,
+            C=C,
+            B_scale=B_scale,
+            B_zp=B_zp,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            num_valid_tokens=topk_ids.numel(),
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            config=config,
+            compute_type=compute_type,
+            block_shape=block_shape,
+            logical_k=K,
+            a_use_tma=a_use_tma,
+            b_use_tma=b_use_tma,
+            c_sorted=c_sorted,
+            filter_expert=filter_expert,
+            fuse_sum_all_reduce=fuse_sum_all_reduce,
+        )
+    elif (
         (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None
         and block_shape[1] > 0
