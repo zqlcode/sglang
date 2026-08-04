@@ -1377,8 +1377,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
-        fp4_scale_dtype = None
-        if self.is_fp4_expert and _is_cuda:
+        fp4_scale_dtype = extra_weight_attrs.pop("fp4_scale_dtype", None)
+        if fp4_scale_dtype is None and self.is_fp4_expert and _is_cuda:
             moe_runner_backend = get_moe_runner_backend()
             if moe_runner_backend.is_triton() or (
                 moe_runner_backend.is_auto()
